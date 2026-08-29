@@ -5,7 +5,7 @@
 //   1. PONYTAIL_DEFAULT_MODE environment variable
 //   2. Config file defaultMode field:
 //      - $XDG_CONFIG_HOME/ponytail/config.json (any platform, if set)
-//      - ~/.config/ponytail/config.json (macOS / Linux fallback)
+//      - ~/.config/ponytail/config.json (POSIX fallback)
 //      - %APPDATA%\ponytail\config.json (Windows fallback)
 //   3. 'full'
 
@@ -42,15 +42,6 @@ function isDeactivationCommand(text) {
   return t === 'stop ponytail' || t === 'normal mode';
 }
 
-// ponytail: only embed the plugin install path in a statusline shell command when
-// it's made of ordinary path characters. An allowlist beats escaping every shell's
-// metacharacters; a hostile clone path (quotes, &, $, backtick, ;, etc.) falls back
-// to manual setup instead. Allows : \ / for normal Windows and POSIX paths. Full
-// per-shell escaper only if a real need appears.
-function isShellSafe(p) {
-  return typeof p === 'string' && /^[A-Za-z0-9 _.\-:/\\~]+$/.test(p);
-}
-
 function getConfigDir() {
   if (process.env.XDG_CONFIG_HOME) {
     return path.join(process.env.XDG_CONFIG_HOME, 'ponytail');
@@ -68,69 +59,27 @@ function getConfigPath() {
   return path.join(getConfigDir(), 'config.json');
 }
 
-function getClaudeDir() {
-  // ponytail: CLAUDE_CONFIG_DIR overrides ~/.claude, matching Claude Code.
-  return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-}
-
 function getDefaultMode() {
   // 1. Environment variable (highest priority)
-  const envMode = process.env.PONYTAIL_DEFAULT_MODE;
+  const envMode = normalizeMode(process.env.PONYTAIL_DEFAULT_MODE);
   // ponytail: a default must be a runtime level (off/lite/full/ultra); review is
   // a session-only mode, never a valid default (#377). Validate against
   // RUNTIME_MODES so a stray env var or config can't make review the default.
-  if (envMode && RUNTIME_MODES.includes(envMode.toLowerCase())) {
-    return envMode.toLowerCase();
-  }
+  if (envMode) return envMode;
 
   // 2. Config file
   try {
     const configPath = getConfigPath();
     // Strip UTF-8 BOM (common on Windows-saved files) so JSON.parse doesn't choke
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
-    if (config.defaultMode && RUNTIME_MODES.includes(config.defaultMode.toLowerCase())) {
-      return config.defaultMode.toLowerCase();
-    }
+    const configuredMode = normalizeMode(config.defaultMode);
+    if (configuredMode) return configuredMode;
   } catch (e) {
     // Config file doesn't exist or is invalid — fall through
   }
 
   // 3. Default
   return DEFAULT_MODE;
-}
-
-// Silence the pi "Ponytail loaded" startup toast while keeping ponytail active.
-// PONYTAIL_QUIET_STARTUP=1 (or any truthy value; 0/false/empty mean "show it")
-// takes precedence, else config.quietStartup === true. Mirrors getHideStatus.
-function getQuietStartup() {
-  const env = process.env.PONYTAIL_QUIET_STARTUP;
-  if (env !== undefined) {
-    const v = env.trim().toLowerCase();
-    return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
-  }
-  try {
-    const config = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8').replace(/^\uFEFF/, ''));
-    return config.quietStartup === true;
-  } catch (_) {
-    return false;
-  }
-}
-
-// Hide the status-bar indicator while keeping ponytail active (#324).
-// PONYTAIL_HIDE_STATUS=1 (or any truthy value; 0/false/empty mean "don't hide")
-// takes precedence, else config.hideStatus === true.
-function getHideStatus() {
-  const env = process.env.PONYTAIL_HIDE_STATUS;
-  if (env !== undefined) {
-    const v = env.trim().toLowerCase();
-    return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
-  }
-  try {
-    const config = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8').replace(/^\uFEFF/, ''));
-    return config.hideStatus === true;
-  } catch (_) {
-    return false;
-  }
 }
 
 function writeDefaultMode(mode) {
@@ -157,10 +106,6 @@ module.exports = {
   getDefaultMode,
   getConfigDir,
   getConfigPath,
-  getClaudeDir,
-  getHideStatus,
-  getQuietStartup,
-  isShellSafe,
   normalizeMode,
   normalizeConfigMode,
   normalizePersistedMode,

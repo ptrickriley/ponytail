@@ -1,492 +1,307 @@
 #!/usr/bin/env node
 
-const assert = require('assert');
+const test = require('node:test');
+const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
+const { writeDefaultMode } = require('../hooks/ponytail-config');
+const { filterSkillBodyForMode } = require('../hooks/ponytail-instructions');
 
-// isShellSafe gates the statusline setup snippet (issue #200): ordinary install
-// paths pass, paths carrying shell metacharacters are rejected so they never get
-// embedded in a shell command.
-const { DEFAULT_MODE, getDefaultMode, isShellSafe, writeDefaultMode } = require('../hooks/ponytail-config');
-assert.equal(isShellSafe('C:\\Users\\x\\.claude\\plugins\\ponytail\\hooks\\ponytail-statusline.ps1'), true);
-assert.equal(isShellSafe('/home/u/.claude/plugins/ponytail/hooks/ponytail-statusline.sh'), true);
-assert.equal(isShellSafe('/tmp/a"&calc.exe&"/x.sh'), false);
-assert.equal(isShellSafe('/tmp/$(calc)/x.sh'), false);
-assert.equal(isShellSafe('/tmp/a;rm -rf/x.sh'), false);
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-codex-'));
+process.on('exit', () => fs.rmSync(temp, { recursive: true, force: true }));
 
-function run(script, env, input = '') {
+function run(script, env = {}, input = '') {
+  const childEnv = { ...process.env };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined || value === null) delete childEnv[key];
+    else childEnv[key] = String(value);
+  }
   return spawnSync(process.execPath, [path.join(root, 'hooks', script)], {
-    env: { ...process.env, ...env },
+    env: childEnv,
     input,
     encoding: 'utf8',
   });
 }
 
-// Keep the base env clean so the default-dir / native-Claude checks are
-// deterministic; the CLAUDE_CONFIG_DIR and codex/copilot cases set these
-// explicitly where needed. run() spreads process.env, so a PLUGIN_DATA /
-// COPILOT_PLUGIN_DATA leaked from the dev or CI shell would otherwise steer
-// writeHookOutput into the wrong branch and mis-fire the native assertions.
-delete process.env.CLAUDE_CONFIG_DIR;
-delete process.env.PLUGIN_DATA;
-delete process.env.COPILOT_PLUGIN_DATA;
-// A leaked subagent matcher would scope the inject-into-every-subagent assertions.
-delete process.env.PONYTAIL_SUBAGENT_MATCHER;
-delete process.env.QODER_SESSION_ID;
-
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-hooks-'));
-// Runs on normal exit and on assertion-throw exit; force makes it idempotent.
-process.on('exit', () => fs.rmSync(temp, { recursive: true, force: true }));
-
-const home = path.join(temp, 'home');
-const pluginData = path.join(temp, 'plugin-data');
-fs.mkdirSync(home, { recursive: true });
-
-// USERPROFILE alongside HOME: os.homedir() reads USERPROFILE on Windows, HOME on POSIX.
-const codexEnv = {
-  HOME: home,
-  USERPROFILE: home,
-  PLUGIN_DATA: pluginData,
-  PONYTAIL_DEFAULT_MODE: 'ultra',
-};
-const codexState = path.join(pluginData, '.ponytail-active');
-
-let result = run('ponytail-activate.js', codexEnv);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'ultra');
-let output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:ULTRA');
-assert.equal(output.additionalContext, undefined, 'Codex must not emit additionalContext at top level (#573)');
-assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: ultra/,
-);
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: '@ponytail lite' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'lite');
-output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:LITE');
-
-// Querying bare @ponytail should report the active level ('lite') without resetting it to default ('ultra')
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: '@ponytail' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'lite');
-output = JSON.parse(result.stdout);
-assert.equal(output.additionalContext, undefined, 'Codex must not emit additionalContext at top level (#573)');
-assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: lite/,
-);
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: 'normal mode' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.existsSync(codexState), false);
-output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:OFF');
-
-// A request that merely mentions "normal mode" must not deactivate ponytail.
-result = run('ponytail-mode-tracker.js', codexEnv, JSON.stringify({ prompt: '@ponytail lite' }));
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'lite');
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: 'add a normal mode toggle next to dark mode' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(codexState, 'utf8'),
-  'lite',
-  'incidental "normal mode" in a request must not turn ponytail off',
-);
-
-const claudeEnv = {
-  HOME: home,
-  USERPROFILE: home,
-  PONYTAIL_DEFAULT_MODE: 'full',
-};
-delete claudeEnv.PLUGIN_DATA;
-
-result = run('ponytail-activate.js', claudeEnv);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(path.join(home, '.claude', '.ponytail-active'), 'utf8'),
-  'full',
-);
-
-// CLAUDE_CONFIG_DIR overrides ~/.claude for the flag file (issue #34).
-const home2 = path.join(temp, 'home2');
-fs.mkdirSync(home2, { recursive: true });
-const customConfigDir = path.join(temp, 'custom-claude');
-result = run('ponytail-activate.js', {
-  HOME: home2,
-  USERPROFILE: home2,
-  CLAUDE_CONFIG_DIR: customConfigDir,
-  PONYTAIL_DEFAULT_MODE: 'lite',
-});
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(path.join(customConfigDir, '.ponytail-active'), 'utf8'),
-  'lite',
-);
-assert.equal(
-  fs.existsSync(path.join(home2, '.claude', '.ponytail-active')),
-  false,
-  'flag must not land in ~/.claude when CLAUDE_CONFIG_DIR is set',
-);
-// The statusline setup nudge must point at the configured settings.json, not a
-// hardcoded ~/.claude (issue #250).
-assert.ok(
-  result.stdout.includes(path.join(customConfigDir, 'settings.json')),
-  'statusline nudge must reference the CLAUDE_CONFIG_DIR settings.json',
-);
-
-// #483: the statusline nudge fires at most once — after it writes its flag, a
-// later session stays silent instead of re-nagging on every start.
-assert.ok(
-  fs.existsSync(path.join(customConfigDir, '.ponytail-statusline-nudged')),
-  'first nudge must write the once-only flag (#483)',
-);
-const secondNudge = run('ponytail-activate.js', {
-  HOME: home2,
-  USERPROFILE: home2,
-  CLAUDE_CONFIG_DIR: customConfigDir,
-  PONYTAIL_DEFAULT_MODE: 'lite',
-});
-assert.equal(secondNudge.status, 0, secondNudge.stderr);
-assert.ok(
-  !secondNudge.stdout.includes('STATUSLINE SETUP NEEDED'),
-  'nudge must not repeat once the flag file exists (#483)',
-);
-
-const copilotData = path.join(temp, 'copilot-data');
-const codexData = path.join(temp, 'codex-data-shadow');
-result = run('ponytail-activate.js', {
-  HOME: home,
-  USERPROFILE: home,
-  COPILOT_PLUGIN_DATA: copilotData,
-  PLUGIN_DATA: codexData,
-  PONYTAIL_DEFAULT_MODE: 'full',
-});
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(path.join(copilotData, '.ponytail-active'), 'utf8'), 'full');
-assert.equal(
-  fs.existsSync(path.join(codexData, '.ponytail-active')),
-  false,
-  'copilot hooks must not write mode state to codex PLUGIN_DATA',
-);
-output = JSON.parse(result.stdout);
-assert.match(output.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-// VS Code Copilot never sets COPILOT_PLUGIN_DATA — it only injects
-// CLAUDE_PLUGIN_ROOT pointed at an agent-plugins/.../.vscode install path
-// (#528). Without a fallback, isCopilot was false, so ponytail assumed
-// native Claude Code and emitted the statusline nudge — noise, since VS
-// Code Copilot doesn't read Claude's statusLine setting.
-const vscodeHome = path.join(temp, 'vscode-copilot-home');
-const vscodePluginRoot = path.join(
-  vscodeHome, '.vscode', 'agent-plugins', 'github.com', 'DietrichGebert', 'ponytail', 'hooks',
-);
-fs.mkdirSync(vscodeHome, { recursive: true });
-result = run('ponytail-activate.js', {
-  HOME: vscodeHome,
-  USERPROFILE: vscodeHome,
-  CLAUDE_PLUGIN_ROOT: vscodePluginRoot,
-  PONYTAIL_DEFAULT_MODE: 'full',
-});
-assert.equal(result.status, 0, result.stderr);
-assert.ok(
-  !result.stdout.includes('STATUSLINE SETUP NEEDED'),
-  'VS Code Copilot (detected via CLAUDE_PLUGIN_ROOT) must not get the Claude-only statusline nudge',
-);
-// isCopilot must still resolve a state dir even though COPILOT_PLUGIN_DATA
-// is unset under VS Code — falling back to ~/.claude, not crashing on an
-// undefined path.
-assert.equal(
-  fs.readFileSync(path.join(vscodeHome, '.claude', '.ponytail-active'), 'utf8'),
-  'full',
-  'VS Code Copilot must persist mode state under getClaudeDir(), not a path built from the unset COPILOT_PLUGIN_DATA',
-);
-
-result = run(
-  'ponytail-mode-tracker.js',
-  {
-    HOME: home,
-    USERPROFILE: home,
-    COPILOT_PLUGIN_DATA: copilotData,
-    PLUGIN_DATA: codexData,
-  },
-  JSON.stringify({ prompt: '/ponytail ultra' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(path.join(copilotData, '.ponytail-active'), 'utf8'), 'ultra');
-assert.equal(
-  fs.existsSync(path.join(codexData, '.ponytail-active')),
-  false,
-  'copilot mode tracker must keep codex PLUGIN_DATA untouched',
-);
-output = JSON.parse(result.stdout);
-assert.deepEqual(output, {});
-
-// SubagentStart hook: when ponytail mode is active it injects the ruleset into
-// each subagent (issue #252). Native Claude must get the hookSpecificOutput JSON
-// form, not raw stdout, or the context is dropped.
-const subHome = path.join(temp, 'sub-home');
-const subFlag = path.join(subHome, '.claude', '.ponytail-active');
-fs.mkdirSync(path.dirname(subFlag), { recursive: true });
-const subEnv = { HOME: subHome, USERPROFILE: subHome };
-
-fs.writeFileSync(subFlag, 'full');
-result = run('ponytail-subagent.js', subEnv);
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: full/,
-);
-
-// No flag → ponytail off → inject nothing (empty stdout, no failure).
-fs.unlinkSync(subFlag);
-result = run('ponytail-subagent.js', subEnv);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(result.stdout, '', 'SubagentStart must stay silent when ponytail is off');
-
-// Codex shares claude-codex-hooks.json, so SubagentStart is reachable under Codex
-// too — assert the codex branch emits the badge plus hookSpecificOutput.
-const subCodex = path.join(temp, 'sub-codex');
-fs.mkdirSync(subCodex, { recursive: true });
-fs.writeFileSync(path.join(subCodex, '.ponytail-active'), 'full');
-result = run('ponytail-subagent.js', { HOME: subHome, USERPROFILE: subHome, PLUGIN_DATA: subCodex });
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:FULL');
-assert.equal(output.additionalContext, undefined, 'Codex must not emit additionalContext at top level (#573)');
-assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
-assert.match(output.hookSpecificOutput.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-// SubagentStart scoping (issue #506): PONYTAIL_SUBAGENT_MATCHER limits the
-// injection to agent types whose name matches the regex. Unset keeps the
-// inject-into-every-subagent behavior asserted above. The matcher is
-// case-insensitive and unanchored, and every uncertain case fails open.
-const scopeHome = path.join(temp, 'scope-home');
-const scopeFlag = path.join(scopeHome, '.claude', '.ponytail-active');
-fs.mkdirSync(path.dirname(scopeFlag), { recursive: true });
-fs.writeFileSync(scopeFlag, 'full');
-const scopeEnv = { HOME: scopeHome, USERPROFILE: scopeHome };
-
-// Matching agent_type → inject; the match is case-insensitive.
-result = run(
-  'ponytail-subagent.js',
-  { ...scopeEnv, PONYTAIL_SUBAGENT_MATCHER: 'general|plan' },
-  JSON.stringify({ agent_type: 'General-purpose' }),
-);
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
-assert.match(output.hookSpecificOutput.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-// agent_type the matcher rejects → stay silent.
-result = run(
-  'ponytail-subagent.js',
-  { ...scopeEnv, PONYTAIL_SUBAGENT_MATCHER: 'general|plan' },
-  JSON.stringify({ agent_type: 'Explore' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(result.stdout, '', 'a non-matching agent_type must skip the injection');
-
-// Anchored regex → exact match only; a superset name is rejected.
-result = run(
-  'ponytail-subagent.js',
-  { ...scopeEnv, PONYTAIL_SUBAGENT_MATCHER: '^general$' },
-  JSON.stringify({ agent_type: 'general-purpose' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(result.stdout, '', 'an anchored matcher must not match a superset agent_type');
-
-// Matcher set but agent_type absent → the platform didn't report it; fail
-// open and inject rather than silently dropping the persona (issue #252).
-result = run(
-  'ponytail-subagent.js',
-  { ...scopeEnv, PONYTAIL_SUBAGENT_MATCHER: 'general' },
-  JSON.stringify({}),
-);
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.match(output.hookSpecificOutput.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-// Invalid regex → must not crash; fall back to injecting everywhere.
-result = run(
-  'ponytail-subagent.js',
-  { ...scopeEnv, PONYTAIL_SUBAGENT_MATCHER: '(' },
-  JSON.stringify({ agent_type: 'anything' }),
-);
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
-
-// The default (no matcher) path must not depend on stdin: even with stdin
-// closed empty it injects synchronously, preserving the #252 behavior on
-// Windows where the piped JSON can be swallowed (#443).
-result = run('ponytail-subagent.js', scopeEnv, '');
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.match(output.hookSpecificOutput.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-// Qoder: no SessionStart event, so UserPromptSubmit does double duty —
-// it activates the default mode on first prompt (writes flag), then injects
-// the ruleset via additionalContext on every prompt. Output is
-// hookSpecificOutput JSON (same shape as Codex minus systemMessage).
-const qoderHome = path.join(temp, 'qoder-home');
-const qoderState = path.join(qoderHome, '.qoder', '.ponytail-active');
-fs.mkdirSync(qoderHome, { recursive: true });
-
-const qoderEnv = {
-  HOME: qoderHome,
-  USERPROFILE: qoderHome,
-  QODER_SESSION_ID: 'test-session-123',
-  PONYTAIL_DEFAULT_MODE: 'full',
-};
-
-// First prompt: no flag file yet → mode-tracker initializes from default,
-// writes flag, and injects the ruleset.
-result = run(
-  'ponytail-mode-tracker.js',
-  qoderEnv,
-  JSON.stringify({ prompt: 'write a function' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(qoderState, 'utf8'), 'full');
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: full/,
-);
-
-// /ponytail ultra: mode tracker updates flag and injects ultra ruleset.
-result = run(
-  'ponytail-mode-tracker.js',
-  qoderEnv,
-  JSON.stringify({ prompt: '/ponytail ultra' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(qoderState, 'utf8'), 'ultra');
-output = JSON.parse(result.stdout);
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE CHANGED — level: ultra/,
-);
-
-// "stop ponytail": deactivates, clears flag, no ruleset output.
-result = run(
-  'ponytail-mode-tracker.js',
-  qoderEnv,
-  JSON.stringify({ prompt: 'stop ponytail' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.existsSync(qoderState), false, 'flag must be cleared after stop ponytail');
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.additionalContext, 'PONYTAIL MODE OFF');
-
-// Subagent injection via PreToolUse (task|Task matcher): when ponytail is
-// active, the subagent hook injects the ruleset. Qoder shares the same
-// ponytail-subagent.js script; the isQoder branch outputs hookSpecificOutput
-// JSON instead of raw stdout.
-fs.writeFileSync(qoderState, 'full');
-result = run('ponytail-subagent.js', qoderEnv);
-assert.equal(result.status, 0, result.stderr);
-output = JSON.parse(result.stdout);
-assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: full/,
-);
-// writeDefaultMode must merge into existing config, not overwrite it (#490).
-const mergeHome = path.join(temp, 'merge-home');
-const mergeConfigDir = path.join(mergeHome, '.config', 'ponytail');
-fs.mkdirSync(mergeConfigDir, { recursive: true });
-const mergeConfigPath = path.join(mergeConfigDir, 'config.json');
-fs.writeFileSync(mergeConfigPath, JSON.stringify({ defaultMode: 'full', customSetting: 42 }, null, 2));
-
-const prevXdg = process.env.XDG_CONFIG_HOME;
-process.env.XDG_CONFIG_HOME = path.join(mergeHome, '.config');
-try {
-  writeDefaultMode('ultra');
-  const merged = JSON.parse(fs.readFileSync(mergeConfigPath, 'utf8'));
-  assert.equal(merged.defaultMode, 'ultra', 'writeDefaultMode must update defaultMode');
-  assert.equal(merged.customSetting, 42, 'writeDefaultMode must preserve existing config fields');
-} finally {
-  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = prevXdg;
+function assertOk(result) {
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.error, undefined);
 }
 
-// #329: `/ponytail default <mode>` persists the default to config (survives
-// restart), while a plain switch stays session-scoped and never touches config.
-const defHome = path.join(temp, 'default-cmd-home');
-const defEnv = { HOME: defHome, USERPROFILE: defHome, XDG_CONFIG_HOME: path.join(defHome, '.config') };
-const defConfig = path.join(defHome, '.config', 'ponytail', 'config.json');
-const defFlag = path.join(defHome, '.claude', '.ponytail-active');
-
-result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/ponytail default lite' }));
-assert.equal(result.status, 0, result.stderr);
-assert.equal(JSON.parse(fs.readFileSync(defConfig, 'utf8')).defaultMode, 'lite', '/ponytail default must persist the default');
-assert.equal(fs.existsSync(defFlag), false, '/ponytail default must not change the session mode');
-
-// A plain switch is transient: sets the session flag, leaves the default alone.
-result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/ponytail ultra' }));
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(defFlag, 'utf8'), 'ultra', 'plain switch must set the session mode');
-assert.equal(JSON.parse(fs.readFileSync(defConfig, 'utf8')).defaultMode, 'lite', 'plain switch must not persist the default');
-
-// review is not a valid default (#377) — the command is ignored, config unchanged.
-result = run('ponytail-mode-tracker.js', defEnv, JSON.stringify({ prompt: '/ponytail default review' }));
-assert.equal(result.status, 0, result.stderr);
-assert.equal(JSON.parse(fs.readFileSync(defConfig, 'utf8')).defaultMode, 'lite', 'review must not be accepted as a default');
-
-// review must be refused as a default by the config functions too, not only the
-// mode-tracker command path (#377): writing it is a no-op, and a stray
-// PONYTAIL_DEFAULT_MODE=review falls back to the built-in default.
-const revHome = path.join(temp, 'review-default-home');
-const revConfigDir = path.join(revHome, '.config', 'ponytail');
-fs.mkdirSync(revConfigDir, { recursive: true });
-const revConfigPath = path.join(revConfigDir, 'config.json');
-fs.writeFileSync(revConfigPath, JSON.stringify({ defaultMode: 'lite' }, null, 2));
-
-const prevXdgRev = process.env.XDG_CONFIG_HOME;
-const prevEnvModeRev = process.env.PONYTAIL_DEFAULT_MODE;
-process.env.XDG_CONFIG_HOME = path.join(revHome, '.config');
-try {
-  assert.equal(writeDefaultMode('review'), null, 'writeDefaultMode must refuse review as a default (#377)');
-  assert.equal(JSON.parse(fs.readFileSync(revConfigPath, 'utf8')).defaultMode, 'lite', 'a refused review write must leave the config unchanged');
-
-  delete process.env.PONYTAIL_DEFAULT_MODE;
-  fs.rmSync(revConfigPath);
-  process.env.PONYTAIL_DEFAULT_MODE = 'review';
-  assert.equal(getDefaultMode(), DEFAULT_MODE, 'PONYTAIL_DEFAULT_MODE=review must fall back to the built-in default');
-} finally {
-  if (prevXdgRev === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevXdgRev;
-  if (prevEnvModeRev === undefined) delete process.env.PONYTAIL_DEFAULT_MODE; else process.env.PONYTAIL_DEFAULT_MODE = prevEnvModeRev;
+function outputOf(result) {
+  assertOk(result);
+  assert.doesNotThrow(() => JSON.parse(result.stdout));
+  return JSON.parse(result.stdout);
 }
 
-console.log('hook compatibility checks passed');
+function envFor(dataDir, configHome, extra = {}) {
+  return {
+    HOME: path.join(temp, 'home'),
+    USERPROFILE: path.join(temp, 'home'),
+    PLUGIN_DATA: dataDir,
+    XDG_CONFIG_HOME: configHome,
+    PONYTAIL_DEFAULT_MODE: null,
+    ...extra,
+  };
+}
+
+test('both plugin manifests are valid Codex metadata', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, '.codex-plugin/plugin.json'), 'utf8'));
+  const marketplace = JSON.parse(fs.readFileSync(path.join(root, '.agents/plugins/marketplace.json'), 'utf8'));
+
+  assert.equal(manifest.name, 'ponytail');
+  assert.equal(manifest.author.name, 'Patrick Riley');
+  assert.equal(manifest.repository, 'https://github.com/ptrickriley/ponytail.git');
+  assert.equal(manifest.skills, './skills/');
+  assert.equal(manifest.hooks, './hooks/codex-hooks.json');
+  assert.equal(manifest.interface.developerName, 'Patrick Riley');
+  assert.equal(marketplace.plugins[0].source.url, 'https://github.com/ptrickriley/ponytail.git');
+});
+
+test('Codex hook manifest names only supported lifecycle hooks and shipped scripts', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, '.codex-plugin/plugin.json'), 'utf8'));
+  const hooksPath = path.join(root, manifest.hooks.slice(2));
+  const config = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+
+  assert.deepEqual(Object.keys(config.hooks).sort(), [
+    'SessionStart',
+    'SubagentStart',
+    'UserPromptSubmit',
+  ]);
+
+  for (const entries of Object.values(config.hooks)) {
+    for (const entry of entries) {
+      for (const hook of entry.hooks) {
+        assert.match(hook.command, /^node \"\$\{PLUGIN_ROOT\}\/hooks\//);
+        const script = hook.command.match(/hooks\/(.+\.js)\"/)[1];
+        assert.ok(fs.existsSync(path.join(root, 'hooks', script)), script);
+      }
+    }
+  }
+});
+
+test('SessionStart activates every runtime default mode', () => {
+  for (const mode of ['off', 'lite', 'full', 'ultra']) {
+    const dataDir = path.join(temp, 'activation', mode);
+    const configHome = path.join(temp, 'config', mode);
+    const result = run(
+      'ponytail-activate.js',
+      envFor(dataDir, configHome, { PONYTAIL_DEFAULT_MODE: mode }),
+    );
+    const output = outputOf(result);
+
+    assert.equal(output.systemMessage, 'PONYTAIL:' + mode.toUpperCase());
+    assert.equal(output.additionalContext, undefined);
+    if (mode === 'off') {
+      assert.equal(fs.existsSync(path.join(dataDir, '.ponytail-active')), false);
+      assert.equal(output.hookSpecificOutput, undefined);
+    } else {
+      assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), mode);
+      assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
+      assert.match(output.hookSpecificOutput.additionalContext, new RegExp('level: ' + mode));
+    }
+  }
+});
+
+test('missing configuration falls back to full without requiring another state directory', () => {
+  const dataDir = path.join(temp, 'missing-config-data');
+  const result = run(
+    'ponytail-activate.js',
+    envFor(dataDir, path.join(temp, 'missing-config')),
+  );
+  const output = outputOf(result);
+
+  assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), 'full');
+  assert.match(output.hookSpecificOutput.additionalContext, /level: full/);
+});
+
+test('persisted default modes are used by the next session', () => {
+  for (const mode of ['lite', 'full', 'ultra', 'off']) {
+    const dataDir = path.join(temp, 'persisted-data', mode);
+    const configHome = path.join(temp, 'persisted-config', mode);
+    const configDir = path.join(configHome, 'ponytail');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'config.json'),
+      JSON.stringify({ defaultMode: mode, keep: true }),
+    );
+
+    const result = run(
+      'ponytail-activate.js',
+      envFor(dataDir, configHome),
+    );
+    const output = outputOf(result);
+    assert.equal(output.systemMessage, 'PONYTAIL:' + mode.toUpperCase());
+    assert.equal(
+      fs.existsSync(path.join(dataDir, '.ponytail-active')),
+      mode !== 'off',
+    );
+  }
+});
+
+test('mode switching, reporting, review, and deactivation use Codex JSON', () => {
+  const dataDir = path.join(temp, 'mode-data');
+  const configHome = path.join(temp, 'mode-config');
+  const env = envFor(dataDir, configHome);
+
+  let output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail lite' }),
+  ));
+  assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), 'lite');
+  assert.equal(output.systemMessage, 'PONYTAIL:LITE');
+  assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+
+  output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail' }),
+  ));
+  assert.match(output.hookSpecificOutput.additionalContext, /level: lite/);
+
+  output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail-review' }),
+  ));
+  assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), 'review');
+  assert.equal(output.systemMessage, 'PONYTAIL:REVIEW');
+
+  output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: 'normal mode' }),
+  ));
+  assert.equal(fs.existsSync(path.join(dataDir, '.ponytail-active')), false);
+  assert.equal(output.systemMessage, 'PONYTAIL:OFF');
+
+  output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail full' }),
+  ));
+  assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), 'full');
+  assertOk(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: 'add a normal mode toggle' }),
+  ));
+  assert.equal(fs.readFileSync(path.join(dataDir, '.ponytail-active'), 'utf8'), 'full');
+
+  output = outputOf(run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail off' }),
+  ));
+  assert.equal(output.systemMessage, 'PONYTAIL:OFF');
+});
+
+test('default command persists without changing the active session', () => {
+  const dataDir = path.join(temp, 'default-command-data');
+  const configHome = path.join(temp, 'default-command-config');
+  const env = envFor(dataDir, configHome);
+  const result = run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail default ultra' }),
+  );
+  const output = outputOf(result);
+
+  assert.equal(JSON.parse(fs.readFileSync(path.join(configHome, 'ponytail/config.json'), 'utf8')).defaultMode, 'ultra');
+  assert.equal(fs.existsSync(path.join(dataDir, '.ponytail-active')), false);
+  assert.match(output.hookSpecificOutput.additionalContext, /new sessions start in ultra/);
+
+  const invalid = run(
+    'ponytail-mode-tracker.js',
+    env,
+    JSON.stringify({ prompt: '@ponytail default review' }),
+  );
+  assertOk(invalid);
+  assert.equal(invalid.stdout, '');
+});
+
+test('subagents receive the active ruleset and stay silent when inactive', () => {
+  const dataDir = path.join(temp, 'subagent-data');
+  const env = envFor(dataDir, path.join(temp, 'subagent-config'));
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, '.ponytail-active'), 'full');
+
+  let output = outputOf(run('ponytail-subagent.js', env));
+  assert.equal(output.systemMessage, 'PONYTAIL:FULL');
+  assert.equal(output.additionalContext, undefined);
+  assert.equal(output.hookSpecificOutput.hookEventName, 'SubagentStart');
+  assert.match(output.hookSpecificOutput.additionalContext, /level: full/);
+
+  fs.writeFileSync(path.join(dataDir, '.ponytail-active'), 'off');
+  const off = run('ponytail-subagent.js', env);
+  assertOk(off);
+  assert.equal(off.stdout, '');
+});
+
+test('malformed hook input is harmless and missing PLUGIN_DATA does not crash', () => {
+  const malformed = run(
+    'ponytail-mode-tracker.js',
+    envFor(path.join(temp, 'malformed-data'), path.join(temp, 'malformed-config')),
+    '{not json',
+  );
+  assert.deepEqual(outputOf(malformed), {});
+
+  const missingData = run(
+    'ponytail-activate.js',
+    envFor(null, path.join(temp, 'no-plugin-data'), { PONYTAIL_DEFAULT_MODE: 'lite' }),
+  );
+  const output = outputOf(missingData);
+  assert.equal(output.systemMessage, 'PONYTAIL:LITE');
+  assert.match(output.hookSpecificOutput.additionalContext, /level: lite/);
+});
+
+test('skill body filtering keeps common rules and one mode-specific row', () => {
+  const body = [
+    '---',
+    'name: example',
+    '---',
+    '# Rules',
+    '| Level | Change |',
+    '| --- | --- |',
+    '| **lite** | small |',
+    '| **full** | normal |',
+    '| **ultra** | smallest |',
+    '- lite: "name the alternative"',
+    '- full: "delete first"',
+    '- Full: keep this ordinary rule.',
+  ].join('\n');
+
+  const lite = filterSkillBodyForMode(body, 'lite');
+  assert.doesNotMatch(lite, /\*\*full\*\*/);
+  assert.doesNotMatch(lite, /\*\*ultra\*\*/);
+  assert.match(lite, /\*\*lite\*\*/);
+  assert.match(lite, /name the alternative/);
+  assert.doesNotMatch(lite, /delete first/);
+  assert.match(lite, /Full: keep this ordinary rule/);
+});
+
+test('writeDefaultMode merges a valid mode into existing config', () => {
+  const configHome = path.join(temp, 'merge-config');
+  const configDir = path.join(configHome, 'ponytail');
+  fs.mkdirSync(configDir, { recursive: true });
+  const configPath = path.join(configDir, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ defaultMode: 'full', custom: 42 }));
+
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = configHome;
+  try {
+    assert.equal(writeDefaultMode('ultra'), 'ultra');
+    assert.deepEqual(JSON.parse(fs.readFileSync(configPath, 'utf8')), {
+      defaultMode: 'ultra',
+      custom: 42,
+    });
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previous;
+  }
+});
