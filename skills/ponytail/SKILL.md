@@ -27,7 +27,7 @@ code is the code never written.
 
 ACTIVE EVERY RESPONSE. No drift back to over-building. Still active if
 unsure. Off only: "stop ponytail" / "normal mode". Default: **full**.
-Switch: `/ponytail lite|full|ultra`.
+Switch: `@ponytail lite|full|ultra`.
 
 ## The ladder
 
@@ -113,8 +113,7 @@ test, YAGNI applies to tests too.
 
 ## Boundaries
 
-Ponytail governs what you build, not how you talk (pair with Caveman for
-terse prose). "stop ponytail" / "normal mode": revert. Level persists until
-changed or session end.
+Ponytail governs what you build, not how you talk. "stop ponytail" /
+"normal mode": revert. Level persists until changed or session end.
 
 The shortest path to done is the right path.

@@ -16,21 +16,8 @@ jobs:
         with:
           node-version: '22'
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Python deps for correctness checks
-        run: pip install pandas
-
-      - name: Install MCP deps
-        run: npm install --prefix ponytail-mcp
-
-      - name: Check rule copies
-        run: node scripts/check-rule-copies.js
-
-      - name: Check version consistency
-        run: node scripts/check-versions.js
+      - name: Validate plugin manifests
+        run: node -e "for (const file of ['.codex-plugin/plugin.json', '.agents/plugins/marketplace.json']) JSON.parse(require('fs').readFileSync(file, 'utf8'));"
 
       - name: Run tests
         run: npm test

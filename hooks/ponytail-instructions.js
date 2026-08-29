@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Shared Ponytail instruction builder for Claude hooks and Pi extension.
+// Shared Ponytail instruction builder for Codex hooks.
 
 const fs = require('fs');
 const path = require('path');
@@ -45,7 +45,7 @@ function getFallbackInstructions(mode) {
     'You are a lazy senior developer. Lazy means efficient, not careless. The best code is the code never written.\n\n' +
     '## Persistence\n\n' +
     'ACTIVE EVERY RESPONSE. No drift back to over-building. Still active if unsure. Off only: "stop ponytail" / "normal mode".\n\n' +
-    'Current level: **' + mode + '**. Switch: `/ponytail lite|full|ultra`.\n\n' +
+    'Current level: **' + mode + '**. Switch: `@ponytail lite|full|ultra`.\n\n' +
     '## The ladder\n\n' +
     'Before any code, stop at the first rung that holds (the ladder runs after you understand the problem, not instead of it — read the code it touches and trace the real flow first):\n' +
     '1. Does this need to be built at all? (YAGNI)\n' +
@@ -78,7 +78,7 @@ function getPonytailInstructions(mode) {
   const configuredMode = normalizePersistedMode(mode) || DEFAULT_MODE;
 
   if (INDEPENDENT_MODES.has(configuredMode)) {
-    return 'PONYTAIL MODE ACTIVE — level: ' + configuredMode + '. Behavior defined by /ponytail-' + configuredMode + ' skill.';
+    return 'PONYTAIL MODE ACTIVE — level: ' + configuredMode + '. Behavior defined by @ponytail-' + configuredMode + ' skill.';
   }
 
   const effectiveMode = normalizeMode(configuredMode) || DEFAULT_MODE;

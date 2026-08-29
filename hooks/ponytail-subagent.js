@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ponytail — Claude Code SubagentStart hook
+// ponytail — Codex SubagentStart hook
 //
 // SessionStart context is parent-thread only and never reaches subagents, so
 // without this every Task-spawned agent runs ponytail-unaware (issue #252).
